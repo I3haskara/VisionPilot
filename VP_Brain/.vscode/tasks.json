@@ -1,0 +1,14 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run FastAPI server with Uvicorn (auto-reload, correct PYTHONPATH)",
+			"type": "shell",
+			"command": "$env:PYTHONPATH=\".\"; uvicorn vp_brain.mcp.selection_server:app --reload",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

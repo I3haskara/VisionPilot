@@ -1,71 +1,104 @@
-Here's the improved `README.md` file that incorporates the new content while maintaining the existing structure and coherence:
-
-# Project Title
+# VisionPilot
 
 ## Overview
 
-This project aims to provide a comprehensive solution for [briefly describe the purpose of the project]. It consists of two primary subprojects: `VP_Brain` (Python) and `VP_Unity` (Unity). 
+VisionPilot brings together a Python “brain” (VP_Brain) and a Unity client (VP_Unity) to power interactive, voice/vision-driven AR experiences. This repository contains both parts and supporting scripts.
 
-## Getting Started
+Repo layout:
+- `VP_Brain/` — Python services, including the Selection FastAPI server and MCP utilities
+- `VP_Unity/` — Unity project (optional, not needed to run the selection server)
 
-The following sections provide minimal steps to get both subprojects running for development or demo purposes.
+## VP_Brain: Selection Server
 
-### VP_Brain (Python)
+The Selection Server is a small FastAPI app that stores the latest user “selection” and exposes two endpoints:
+- `GET /health` → `{ "status": "ok" }`
+- `GET /selection` → returns current selection JSON
+- `POST /selection` → updates the selection
 
-#### Prerequisites:
-- Python 3.10+ (recommended to use a virtual environment)
-- System dependencies for MediaPipe and audio drivers (platform-specific)
+### Quick Start (Windows PowerShell)
 
-#### Quick start:
-# create and activate a virtual environment
-python -m venv .venv
-# Windows
-.\.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
+Minimal dependencies (FastAPI + Uvicorn + Requests for testing):
 
-# install Python dependencies
-pip install --upgrade pip
-pip install -r VP_Brain/requirements.txt
+```powershell
+cd I:\VisionPilot\VP_Brain
+python -m pip install --upgrade pip
+python -m pip install fastapi uvicorn requests
+$env:PYTHONPATH = "."
+python -m uvicorn vp_brain.mcp.selection_server:app --reload
+```
 
-# run the brain (webcam + mic + MCP client)
-python VP_Brain/main.py
+Alternatively, run the module directly (uses an internal __main__ runner):
 
-#### Configuration:
-- Edit `VP_Brain/vp_brain/config.py` to adjust camera, microphone, and MCP server settings.
+```powershell
+cd I:\VisionPilot\VP_Brain
+$env:PYTHONPATH = "."
+python -m vp_brain.mcp.selection_server
+```
 
-### VP_Unity (Unity)
+Helper script (auto-sets `PYTHONPATH`, uses Uvicorn):
 
-#### Prerequisites:
-- Unity Hub and a Unity Editor matching the project's ProjectSettings (open `ProjectSettings/ProjectVersion.txt` for the exact version).
+```powershell
+cd I:\VisionPilot\VP_Brain
+./run_selection_server.ps1
+```
 
-#### Quick start:
-1. Open Unity Hub -> Add -> select the repository's `VP_Unity` folder.
-2. Open the `DemoScene` in `Assets/VisionPilot/Scenes/DemoScene.unity`.
-3. Run the scene in the editor. The Unity project expects the MCP WebSocket server to be available for runtime interactions.
+Note: The old root `selection_server.py` is deprecated. Use the package path `vp_brain.mcp.selection_server`.
+
+### Test It
+
+Health check:
+
+```powershell
+python -c "import requests; print(requests.get('http://127.0.0.1:8000/health').json())"
+```
+
+Post a selection (example with segment metadata):
+
+```powershell
+python -c "import requests; url='http://127.0.0.1:8000/selection'; r=requests.post(url, json={'x':0.5,'y':0.5,'source':'xr','segment_id':'page_1'}); print(r.json())"
+```
+
+Get the latest selection:
+
+```powershell
+python -c "import requests; print(requests.get('http://127.0.0.1:8000/selection').json())"
+```
+
+### Endpoint Contract
+
+Request body for `POST /selection`:
+
+```json
+{
+	"x": 0.0,   // 0.0–1.0
+	"y": 0.0,   // 0.0–1.0
+	"source": "demo|xr|...",  
+	"segment_id": "cover|page_1|page_2|page_3|chapter_2|..."
+}
+```
+
+Response (both GET and POST):
+
+```json
+{
+	"x": 0.5,
+	"y": 0.5,
+	"source": "xr",
+	"segment_id": "page_1",
+	"ts": "2025-12-01T11:22:33.782953"
+}
+```
+
+## VP_Unity
+
+Open the Unity project in `VP_Unity/` with a matching Unity version (see `ProjectSettings/ProjectVersion.txt`). This is optional for running the Python Selection Server.
 
 ## Notes
-- This repository includes standard formatting and contribution files (e.g., `.editorconfig`, `CONTRIBUTING.md`) to enforce coding standards and development workflows.
-- See the `docs/` directory for architecture details, demo scripts, and product pitch information.
-
-## License
-
-[Include license information here, if applicable.]
+- Windows PowerShell is the primary shell assumed in examples.
+- If you need to expose the server to other devices, start Uvicorn with `--host 0.0.0.0`.
 
 ## Contributing
+PRs welcome. Please follow existing code style and keep changes minimal and focused.
 
-We welcome contributions! Please refer to `CONTRIBUTING.md` for guidelines on how to contribute to this project.
-
-## Contact
-
-For any inquiries, please reach out to [your contact information or link to an issues page].
-
-
-### Changes Made:
-1. **Added Section Headers**: Included headers for clarity and organization.
-2. **Expanded Overview**: Provided a brief description of the project purpose (placeholder text).
-3. **Formatted Prerequisites and Quick Start**: Used bullet points and headings for better readability.
-4. **Added License and Contributing Sections**: Included placeholders for license and contribution guidelines to encourage community involvement.
-5. **Contact Information**: Added a section for contact details to facilitate communication.
-
-This structure enhances the flow and coherence of the document while ensuring that all necessary information is clearly presented.
+## License
+TBD
