@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Environments
+venv/
+.venv/
+ENV/
+env/
+pip-wheel-metadata/
+
+# Project-specific venvs
+VP_Brain/venv/
+visionpilot-vertical-slice/VP_Brain/venv/
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets
+.env
