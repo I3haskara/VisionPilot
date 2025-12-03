@@ -3,6 +3,20 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional
 
+
+class SegmentContext(BaseModel):
+    segment_group_id: str
+    label: str | None = None
+
+
+class AIResponse(BaseModel):
+    segment_group_id: str
+    intent: str
+    action: str
+    message: str
+    emotion: str = "neutral"
+    effects: dict = {}
+
 app = FastAPI(title="VisionPilot Selection Server")
 
 SEGMENTS = {
@@ -71,6 +85,42 @@ def set_selection(sel: Selection):
         ts=datetime.utcnow(),
     )
     return latest_selection
+
+
+@app.post("/ai/segment", response_model=AIResponse)
+async def handle_segment(context: SegmentContext) -> AIResponse:
+    sgid = context.segment_group_id
+
+    # TEMP: simple hardcoded logic for demo
+    if sgid.startswith("plant"):
+        return AIResponse(
+            segment_group_id=sgid,
+            intent="educational_fact",
+            action="speak_and_highlight",
+            message=f"This is {context.label or 'a plant'}. It likes indirect light and moist soil.",
+            emotion="friendly",
+            effects={"highlight": True, "emoji": "🌱", "hologram": False},
+        )
+
+    if sgid.startswith("book"):
+        return AIResponse(
+            segment_group_id=sgid,
+            intent="assistant_tip",
+            action="speak",
+            message="You were reading this last time. Do you want a quick summary?",
+            emotion="neutral",
+            effects={"highlight": False, "emoji": "📖", "hologram": False},
+        )
+
+    # default fallback
+    return AIResponse(
+        segment_group_id=sgid,
+        intent="smalltalk",
+        action="speak",
+        message="I see something interesting there. I’ll learn more about it next time.",
+        emotion="casual",
+        effects={"highlight": False, "emoji": "✨", "hologram": False},
+    )
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ Repo layout:
 - `VP_Brain/` — Python services, including the Selection FastAPI server and MCP utilities
 - `VP_Unity/` — Unity project (optional, not needed to run the selection server)
 
+For first-time setup on a new machine, see `PORTING.md`.
+
 ## VP_Brain: Selection Server
 
 The Selection Server is a small FastAPI app that stores the latest user “selection” and exposes two endpoints:
