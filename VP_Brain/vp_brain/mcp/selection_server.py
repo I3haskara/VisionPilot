@@ -1,10 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 
-class SegmentContext(BaseModel):
+class SegmentRequest(BaseModel):
     segment_group_id: str
     label: str | None = None
 
@@ -15,7 +15,8 @@ class AIResponse(BaseModel):
     action: str
     message: str
     emotion: str = "neutral"
-    effects: dict = {}
+    effects: Dict[str, bool] = Field(default_factory=dict)
+    model_url: Optional[str] = None
 
 app = FastAPI(title="VisionPilot Selection Server")
 
@@ -88,8 +89,20 @@ def set_selection(sel: Selection):
 
 
 @app.post("/ai/segment", response_model=AIResponse)
-async def handle_segment(context: SegmentContext) -> AIResponse:
-    sgid = context.segment_group_id
+async def handle_segment(req: SegmentRequest) -> AIResponse:
+    sgid = req.segment_group_id
+
+    # Special demo object
+    if sgid == "plant_01":
+        return AIResponse(
+            segment_group_id=sgid,
+            intent="educational_fact",
+            action="speak_highlight_and_spawn_hologram",
+            message="This is Peace Lily. It likes indirect light and moist soil.",
+            emotion="friendly",
+            effects={"highlight": True, "hologram": True},
+            model_url="https://your-cdn-or-hyper3d-url/plant_01.glb",
+        )
 
     # TEMP: simple hardcoded logic for demo
     if sgid.startswith("plant"):
@@ -97,9 +110,9 @@ async def handle_segment(context: SegmentContext) -> AIResponse:
             segment_group_id=sgid,
             intent="educational_fact",
             action="speak_and_highlight",
-            message=f"This is {context.label or 'a plant'}. It likes indirect light and moist soil.",
+            message=f"This is {req.label or 'a plant'}. It likes indirect light and moist soil.",
             emotion="friendly",
-            effects={"highlight": True, "emoji": "🌱", "hologram": False},
+            effects={"highlight": True, "hologram": False},
         )
 
     if sgid.startswith("book"):
@@ -109,7 +122,7 @@ async def handle_segment(context: SegmentContext) -> AIResponse:
             action="speak",
             message="You were reading this last time. Do you want a quick summary?",
             emotion="neutral",
-            effects={"highlight": False, "emoji": "📖", "hologram": False},
+            effects={"highlight": False, "hologram": False},
         )
 
     # default fallback
@@ -119,7 +132,7 @@ async def handle_segment(context: SegmentContext) -> AIResponse:
         action="speak",
         message="I see something interesting there. I’ll learn more about it next time.",
         emotion="casual",
-        effects={"highlight": False, "emoji": "✨", "hologram": False},
+        effects={"highlight": False, "hologram": False},
     )
 
 
