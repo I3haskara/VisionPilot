@@ -30,6 +30,16 @@ python -m venv venv
 ./venv/Scripts/Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r VP_Brain/requirements.txt
+## Configure environment variables
+
+- Create a `.env` file in the repository root and add your Gemini API key:
+
+```
+GEMINI_API_KEY=YOUR_KEY_HERE
+```
+
+- The server loads `.env` automatically via `python-dotenv`. Ensure `VP_Brain/requirements.txt` is installed.
+
 ```
 
 macOS/Linux:
@@ -80,6 +90,18 @@ cd VP_Brain
 ```
 
 - Legacy: `run_selection_server.ps1` if present.
+
+## Deploying to Render (or similar)
+
+- Start command must target the packaged app:
+
+```bash
+uvicorn vp_brain.mcp.selection_server:app --host 0.0.0.0 --port $PORT
+```
+
+- Ensure dependencies install from `VP_Brain/requirements.txt` and include `python-multipart` for file uploads.
+- After deploy, verify `/openapi.json` includes `/ai/voice_command` and `/docs` shows the route under the `default` tag.
+- If the route is missing, the service likely started a different module. Point the start command to `vp_brain.mcp.selection_server:app`.
 
 Notes:
 - If you need to reach the server from other devices on your LAN, use `--host 0.0.0.0` and allow the port through your firewall.
