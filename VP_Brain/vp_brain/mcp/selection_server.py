@@ -22,6 +22,17 @@ class AIResponse(BaseModel):
 app = FastAPI(title="VisionPilot Selection Server")
 app.include_router(voice_router, prefix="/ai")
 
+# Log mounted routes at startup to catch path mismatches in deployments
+@app.on_event("startup")
+async def _log_routes():
+    try:
+        routes = [getattr(r, "path", None) for r in app.router.routes]
+        print("[startup] Mounted routes:", routes)
+        assert "/ai/voice_command" in routes, "Voice route not mounted; check import and include_router prefix"
+    except Exception as exc:
+        # Do not crash the app on logging issues; just report
+        print(f"[startup] Route logging warning: {exc}")
+
 SEGMENTS = {
     "cover": {
         "description": "Front cover of the magic book",
