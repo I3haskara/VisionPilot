@@ -72,10 +72,14 @@ python -m vp_brain.mcp.selection_server
 
 Option C — Helper script (Windows PowerShell):
 
+- `run_backend.ps1` (recommended): kills any process on `8010`, activates `venv`, sets `PYTHONPATH`, and runs uvicorn on `127.0.0.1:8010`.
+
 ```powershell
 cd VP_Brain
-./run_selection_server.ps1
+../run_backend.ps1
 ```
+
+- Legacy: `run_selection_server.ps1` if present.
 
 Notes:
 - If you need to reach the server from other devices on your LAN, use `--host 0.0.0.0` and allow the port through your firewall.
@@ -86,19 +90,19 @@ Notes:
 Health check:
 
 ```powershell
-python -c "import requests; print(requests.get('http://127.0.0.1:8000/health').json())"
+python -c "import requests; print(requests.get('http://127.0.0.1:8010/health').json())"
 ```
 
 Post a selection:
 
 ```powershell
-python -c "import requests; url='http://127.0.0.1:8000/selection'; r=requests.post(url, json={'x':0.5,'y':0.5,'source':'demo','segment_id':'page_1'}); print(r.json())"
+python -c "import requests; url='http://127.0.0.1:8010/selection'; r=requests.post(url, json={'x':0.5,'y':0.5,'source':'demo','segment_id':'page_1'}); print(r.json())"
 ```
 
 Read the latest selection:
 
 ```powershell
-python -c "import requests; print(requests.get('http://127.0.0.1:8000/selection').json())"
+python -c "import requests; print(requests.get('http://127.0.0.1:8010/selection').json())"
 ```
 
 ## Optional: MCP websocket utilities
@@ -120,8 +124,8 @@ Ensure Unity is listening on the matching websocket port and accepts the message
 
 - ModuleNotFoundError (vp_brain/mcp):
   - Run commands from the `VP_Brain` directory, or set `PYTHONPATH` to `.` (Windows: `$env:PYTHONPATH = "."`; macOS/Linux: `export PYTHONPATH=.`).
-- Port 8000 already in use:
-  - Change the port: `--port 8010`, or stop the existing server using 8000.
+- Port conflicts:
+  - Default dev port is `8010`. If `8010` is in use, pick another (e.g., `8020`) or stop the conflicting service. `run_backend.ps1` auto-clears `8010`.
 - Uvicorn not found:
   - `pip install uvicorn` (or re-run `pip install -r VP_Brain/requirements.txt`).
 - PowerShell script blocked:

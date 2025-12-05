@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Dict, Optional
+from .routes_voice import router as voice_router
 
 
 class SegmentRequest(BaseModel):
@@ -19,6 +20,7 @@ class AIResponse(BaseModel):
     model_url: Optional[str] = None
 
 app = FastAPI(title="VisionPilot Selection Server")
+app.include_router(voice_router, prefix="/ai")
 
 SEGMENTS = {
     "cover": {
