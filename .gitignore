@@ -26,3 +26,11 @@ Thumbs.db
 
 # Secrets
 .env
+VP_Brain/.env
+
+# Generated audio and debug artifacts
+VP_Brain/static_tts/
+VP_Brain/debug_audio/
+
+# Hyper3D data and database
+VP_Brain/data/
