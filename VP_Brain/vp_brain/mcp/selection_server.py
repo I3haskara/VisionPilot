@@ -2,643 +2,207 @@ import base64
 import os
 import uuid
 import sqlite3
-from datetime import datetime
+import os
+import tempfile
+from uuid import uuid4
 from pathlib import Path
-from typing import Dict, Optional
 
-import httpx
-import requests
-from dotenv import load_dotenv
-from openai import OpenAI
-from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
-from .routes_voice import router as voice_router
+from openai import OpenAI
 
-# -------------------------------------------------------------------
-# Load .env explicitly from VP_Brain root (one level above vp_brain/)
-# -------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # F:\SenseAIProject\VisionPilot\VP_Brain
-ENV_PATH = PROJECT_ROOT / ".env"
+# ============================================================
+#  BASIC APP SETUP
+# ============================================================
 
-load_dotenv(dotenv_path=ENV_PATH)
+app = FastAPI()
 
-print(
-    "[env] Loaded .env from", ENV_PATH,
-    "-> HYPER3D_API_KEY=", bool(os.getenv("HYPER3D_API_KEY")),
-    "GOOGLE_API_KEY=", bool(os.getenv("GOOGLE_API_KEY")),
-    "GEMINI_API_KEY=", bool(os.getenv("GEMINI_API_KEY")),
-    "ELEVENLABS_API_KEY=", bool(os.getenv("ELEVENLABS_API_KEY")),
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # lock this down later if needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Extra visibility: log the configured ElevenLabs voice ID (if present)
-if os.getenv("ELEVENLABS_VOICE_ID"):
-    print("[env] ELEVENLABS_VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID"))
+# Static dir to serve generated audio files
+STATIC_DIR = Path("static/audio")
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-# Also log OpenAI credentials presence (not values) for STT
-print(
-    "[env] OPENAI_API_KEY=", bool(os.getenv("OPENAI_API_KEY")),
-    "OPENAI_ORG_ID=", bool(os.getenv("OPENAI_ORG_ID")),
-)
+# Serve /static/*  =>  ./static/*
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-app = FastAPI(title="VisionPilot Selection Server")
-app.include_router(voice_router, prefix="/ai")
+# ============================================================
+#  OPENAI CLIENT + CONFIG
+# ============================================================
 
-# Initialize OpenAI client using env var
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID")
-if OPENAI_API_KEY or OPENAI_ORG_ID:
-    client = OpenAI(api_key=OPENAI_API_KEY, organization=OPENAI_ORG_ID)
-else:
-    client = OpenAI()
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
 
-# --- TTS (ElevenLabs) ---
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-TTS_OUTPUT_DIR = os.getenv("TTS_OUTPUT_DIR", "static_tts")
-os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-tts_router = APIRouter()
+BUDDY_SYSTEM_PROMPT = os.getenv(
+    "BUDDY_SYSTEM_PROMPT",
+    (
+        "You are Buddy, a supportive, slightly witty AR/VR companion. "
+        "Speak in short, natural sentences. Respond like you are inside "
+        "a mixed-reality world helping the user explore and play. "
+        "Avoid long monologues; keep it tight and helpful."
+    ),
+)
+
+# Models (centralized here so you can tweak later)
+STT_MODEL = "gpt-4o-mini-transcribe"  # audio -> text
+CHAT_MODEL = "gpt-4o-mini"            # conversation
+TTS_MODEL = "gpt-4o-mini-tts"         # text -> audio
 
 
-class TTSRequest(BaseModel):
-    text: str
-    voice_id: str | None = None
-    buddy_id: str | None = None
+# ============================================================
+#  HEALTH CHECK
+# ============================================================
 
-
-@tts_router.post("/tts")
-async def tts_generate(req: TTSRequest):
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY not set")
-
-    # Fallback to env voice id if not provided
-    env_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
-    voice_id = req.voice_id or env_voice_id
-    # Debug which voice ID is used and source
-    print(
-        f"[TTS] using voice_id='{voice_id}' (req.voice_id={req.voice_id!r}, env={env_voice_id!r})"
-    )
-    if not voice_id:
-        raise HTTPException(status_code=400, detail="voice_id missing and ELEVENLABS_VOICE_ID not set")
-
-    tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": req.text,
-        "model_id": "eleven_turbo_v2",
-        "voice_settings": {
-            "stability": 0.4,
-            "similarity_boost": 0.8,
-        },
+@app.get("/ping")
+async def ping():
+    return {
+        "status": "ok",
+        "service": "visionpilot-backend",
+        "voice_pipeline": "openai-only",
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(tts_url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"ElevenLabs error: {resp.text}")
-        audio_bytes = resp.content
 
-    file_id = str(uuid.uuid4())
-    file_name = f"{file_id}.mp3"
-    file_path = os.path.join(TTS_OUTPUT_DIR, file_name)
-
-    with open(file_path, "wb") as f:
-        f.write(audio_bytes)
-
-    public_base = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
-    audio_url = f"{public_base}/static_tts/{file_name}"
-
-    return {"audio_url": audio_url}
-
-
-@tts_router.get("/tts/test")
-async def tts_test():
-    """
-    Generate a short test clip using the env-configured ELEVENLABS_VOICE_ID.
-    Returns a public URL to the generated audio.
-    """
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY not set")
-
-    env_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
-    if not env_voice_id:
-        raise HTTPException(status_code=400, detail="ELEVENLABS_VOICE_ID not set in .env")
-
-    tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{env_voice_id}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": "Hello from VisionPilot. This is a quick TTS test.",
-        "model_id": "eleven_turbo_v2",
-    }
-
-    # Debug: show which voice ID is being used from env
-    print(f"[TTS TEST] ELEVENLABS_VOICE_ID from env: {env_voice_id}")
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(tts_url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"ElevenLabs error: {resp.text}")
-        audio_bytes = resp.content
-
-    file_id = str(uuid.uuid4())
-    file_name = f"{file_id}.mp3"
-    file_path = os.path.join(TTS_OUTPUT_DIR, file_name)
-    with open(file_path, "wb") as f:
-        f.write(audio_bytes)
-
-    public_base = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
-    audio_url = f"{public_base}/static_tts/{file_name}"
-    return {"audio_url": audio_url}
-
-
-app.include_router(tts_router)
-app.mount("/static_tts", StaticFiles(directory=TTS_OUTPUT_DIR), name="static_tts")
-
-DEBUG_DIR = Path("debug_audio")
-DEBUG_DIR.mkdir(exist_ok=True)
+# ============================================================
+#  VOICE COMMAND ENDPOINT (STT + CHAT + TTS)
+# ============================================================
 
 @app.post("/voice/command")
-async def voice_command(audio: UploadFile = File(...)):
+async def voice_command(file: UploadFile = File(...)):
     """
-    Main mic → STT → AI → TTS endpoint used by Unity (MicCommandController).
-    Unity sends one form field named 'audio' with a WAV file.
+    1) Receive user audio from Unity (multipart file)
+    2) Transcribe with OpenAI STT
+    3) Generate Buddy reply with OpenAI chat
+    4) Generate speech with OpenAI TTS
+    5) Return transcript, reply_text, and audio_url (mp3)
     """
+
+    # ----------------------------
+    # 1. Save uploaded audio temp
+    # ----------------------------
     try:
-        # 0) Basic validation and logging
-        print(f"[voice_command] filename={audio.filename!r} content_type={audio.content_type!r}")
-        if not audio.filename:
-            raise HTTPException(status_code=400, detail="No audio file uploaded")
+        suffix = Path(file.filename).suffix or ".wav"
+    except Exception:
+        suffix = ".wav"
 
-        # 1) Read bytes and save debug WAV
-        audio_bytes = await audio.read()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded audio is empty")
-
-        debug_path = DEBUG_DIR / "debug_voice.wav"
-        with open(debug_path, "wb") as f:
-            f.write(audio_bytes)
-
-        # 2) Transcribe using Whisper (requires OPENAI_API_KEY; expects WAV/MP3)
-        try:
-            with open(debug_path, "rb") as f:
-                transcription = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                )
-            user_text = (transcription.text or "").strip()
-        except Exception as e:
-            print(f"[voice_command] Transcription error: {e}")
-            raise HTTPException(status_code=502, detail=f"Transcription failed: {e}")
-
-        # 3) Chat completion for AI reply
-        try:
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful AR desk buddy assistant."},
-                    {"role": "user", "content": user_text or ""},
-                ],
-                temperature=0.7,
-            )
-            ai_text = (completion.choices[0].message.content or "").strip()
-        except Exception as e:
-            print(f"[voice_command] Chat completion error: {e}")
-            raise HTTPException(status_code=502, detail=f"AI reply failed: {e}")
-
-        # 4) Return response (no TTS b64 here; hook into your TTS helper if needed)
-        return {
-            "user_text": user_text,
-            "ai_text": ai_text,
-            "action": "spawn",
-            "effects": {"highlight": True, "hologram": True},
-            "model_url": None,
-            "voice_b64": None,
-        }
-    except HTTPException:
-        # Re-raise HTTPExceptions untouched
-        raise
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            raw_data = await file.read()
+            tmp.write(raw_data)
+            tmp_path = Path(tmp.name)
     except Exception as e:
-        # Catch-all to avoid 500 without context
-        print(f"[voice_command] Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-
-
-class SegmentRequest(BaseModel):
-    segment_group_id: str
-    label: str | None = None
-
-
-class AIResponse(BaseModel):
-    segment_group_id: str
-    intent: str
-    action: str
-    message: str
-    emotion: str = "neutral"
-    effects: Dict[str, bool] = Field(default_factory=dict)
-    model_url: Optional[str] = None
-
-
-SEGMENTS = {
-    "cover": {
-        "description": "Front cover of the magic book",
-    },
-    "page_1": {
-        "description": "First AR page / intro scene",
-    },
-    "page_2": {
-        "description": "Second AR page / volcano scene",
-    },
-    "page_3": {
-        "description": "Third AR page / whatever",
-    },
-    "chapter_2": {
-        "description": "Chapter 2 spread",
-    },
-}
-
-
-class Selection(BaseModel):
-    x: float = Field(ge=0.0, le=1.0)
-    y: float = Field(ge=0.0, le=1.0)
-    source: str = "demo"
-    segment_id: Optional[str] = None
-
-
-class SelectionOut(BaseModel):
-    x: float
-    y: float
-    source: str
-    segment_id: Optional[str]
-    ts: datetime
-
-
-# Initial dummy value
-latest_selection = SelectionOut(
-    x=0.5,
-    y=0.5,
-    source="init",
-    segment_id=None,
-    ts=datetime.utcnow(),
-)
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/selection", response_model=SelectionOut)
-def get_selection():
-    return latest_selection
-
-
-@app.post("/selection", response_model=SelectionOut)
-def set_selection(sel: Selection):
-    global latest_selection
-
-    latest_selection = SelectionOut(
-        x=sel.x,
-        y=sel.y,
-        source=sel.source,
-        segment_id=sel.segment_id,
-        ts=datetime.utcnow(),
-    )
-    return latest_selection
-
-
-@app.post("/ai/segment", response_model=AIResponse)
-async def handle_segment(req: SegmentRequest) -> AIResponse:
-    sgid = req.segment_group_id
-
-    # Special demo object
-    if sgid == "plant_01":
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="educational_fact",
-            action="speak_highlight_and_spawn_hologram",
-            message="This is Peace Lily. It likes indirect light and moist soil.",
-            emotion="friendly",
-            effects={"highlight": True, "hologram": True},
-            model_url="https://your-cdn-or-hyper3d-url/plant_01.glb",
-        )
-
-    # TEMP: simple hardcoded logic for demo
-    if sgid.startswith("plant"):
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="educational_fact",
-            action="speak_and_highlight",
-            message=f"This is {req.label or 'a plant'}. It likes indirect light and moist soil.",
-            emotion="friendly",
-            effects={"highlight": True, "hologram": False},
-        )
-
-    if sgid.startswith("book"):
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="assistant_tip",
-            action="speak",
-            message="You were reading this last time. Do you want a quick summary?",
-            emotion="neutral",
-            effects={"highlight": False, "hologram": False},
-        )
-
-    # default fallback
-    return AIResponse(
-        segment_group_id=sgid,
-        intent="smalltalk",
-        action="speak",
-        message="I see something interesting there. I'll learn more about it next time.",
-        emotion="casual",
-        effects={"highlight": False, "hologram": False},
-    )
-
-
-# -------------------------------------------------------------------
-# Hyper3D integration
-# -------------------------------------------------------------------
-HYPER3D_API_KEY = os.getenv("HYPER3D_API_KEY")
-if not HYPER3D_API_KEY:
-    raise RuntimeError("HYPER3D_API_KEY missing in .env")
-
-HYPER3D_BASE_URL = "https://api.hyper3d.com/api/v2"
-HYPER3D_TIER = os.getenv("HYPER3D_TIER", "Gen-2")
-HYPER3D_MESH_MODE = os.getenv("HYPER3D_MESH_MODE", "Raw")
-HYPER3D_MATERIAL = os.getenv("HYPER3D_MATERIAL", "PBR")
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "hyper3d"
-INPUT_DIR = DATA_DIR / "inputs"
-INPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_PATH = DATA_DIR / "hyper3d_buddies.db"
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS hyper3d_buddies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            image_path TEXT NOT NULL,
-            hyper_task_uuid TEXT NOT NULL,
-            subscription_key TEXT NOT NULL,
-            status TEXT NOT NULL,
-            model_url TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-class Hyper3DGenerateRequest(BaseModel):
-    image_b64: str
-    name: str
-
-
-class Hyper3DGenerateResponse(BaseModel):
-    buddy_id: int
-    status: str
-    hyper_task_uuid: str
-    subscription_key: str
-
-
-class Hyper3DStatusResponse(BaseModel):
-    buddy_id: int
-    status: str
-    model_url: Optional[str] = None
-
-
-def hyper3d_submit_task(image_path: Path) -> dict:
-    url = f"{HYPER3D_BASE_URL}/rodin"
-
-    with open(image_path, "rb") as f:
-        image_data = f.read()
-
-    files = {
-        "images": (image_path.name, image_data, "image/jpeg"),
-        "tier": (None, HYPER3D_TIER),
-        "mesh_mode": (None, HYPER3D_MESH_MODE),
-        "material": (None, HYPER3D_MATERIAL),
-    }
-
-    headers = {"Authorization": f"Bearer {HYPER3D_API_KEY}"}
-
-    resp = requests.post(url, files=files, headers=headers, timeout=120)
-    if not resp.ok:
-        raise HTTPException(status_code=502, detail=f"Hyper3D submit failed: {resp.text}")
-    return resp.json()
-
-
-def hyper3d_check_status(subscription_key: str) -> dict:
-    url = f"{HYPER3D_BASE_URL}/status"
-    headers = {
-        "Authorization": f"Bearer {HYPER3D_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"subscription_key": subscription_key}
-    resp = requests.post(url, json=payload, headers=headers, timeout=60)
-    if not resp.ok:
-        raise HTTPException(status_code=502, detail=f"Hyper3D status failed: {resp.text}")
-    return resp.json()
-
-
-def hyper3d_download_results(task_uuid: str) -> dict:
-    url = f"{HYPER3D_BASE_URL}/download"
-    headers = {
-        "Authorization": f"Bearer {HYPER3D_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"task_uuid": task_uuid}
-    resp = requests.post(url, json=payload, headers=headers, timeout=120)
-    if not resp.ok:
-        raise HTTPException(status_code=502, detail=f"Hyper3D download failed: {resp.text}")
-    return resp.json()
-
-
-def save_base64_image(image_b64: str) -> Path:
-    # Handle "data:image/png;base64,..." prefixes
-    if "," in image_b64:
-        image_b64 = image_b64.split(",", 1)[1]
-
-    raw = base64.b64decode(image_b64)
-    fname = f"{uuid.uuid4().hex}.jpg"
-    out_path = INPUT_DIR / fname
-    with open(out_path, "wb") as f:
-        f.write(raw)
-    return out_path
-
-
-@app.post("/hyper3d/generate", response_model=Hyper3DGenerateResponse)
-def hyper3d_generate(payload: Hyper3DGenerateRequest):
-    # 1) Save incoming image
-    image_path = save_base64_image(payload.image_b64)
-
-    # 2) Submit to Hyper3D
-    task = hyper3d_submit_task(image_path)
-    task_uuid = task.get("uuid")
-    jobs = task.get("jobs") or {}
-    subscription_key = jobs.get("subscription_key")
-
-    if not task_uuid or not subscription_key:
-        raise HTTPException(status_code=502, detail=f"Unexpected Hyper3D response: {task}")
-
-    now = datetime.utcnow().isoformat()
-
-    # 3) Insert into DB
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO hyper3d_buddies
-            (name, image_path, hyper_task_uuid, subscription_key, status, model_url, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.name,
-            str(image_path),
-            task_uuid,
-            subscription_key,
-            "submitted",
-            None,
-            now,
-            now,
-        ),
-    )
-    buddy_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    return Hyper3DGenerateResponse(
-        buddy_id=buddy_id,
-        status="submitted",
-        hyper_task_uuid=task_uuid,
-        subscription_key=subscription_key,
-    )
-
-
-@app.get("/hyper3d/status/{buddy_id}", response_model=Hyper3DStatusResponse)
-def hyper3d_status(buddy_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM hyper3d_buddies WHERE id = ?",
-        (buddy_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Buddy not found")
-
-    status = row["status"]
-    model_url = row["model_url"]
-    hyper_task_uuid = row["hyper_task_uuid"]
-    subscription_key = row["subscription_key"]
-
-    # If already done/failed and model_url recorded, just return
-    if status in ("done", "failed"):
-        conn.close()
-        return Hyper3DStatusResponse(buddy_id=buddy_id, status=status, model_url=model_url)
-
-    # Otherwise call Hyper3D /status
-    status_resp = hyper3d_check_status(subscription_key)
-    jobs = status_resp.get("jobs", [])
-
-    # If Hyper3D structure changes, bail safely
-    if not isinstance(jobs, list) or len(jobs) == 0:
-        conn.close()
-        raise HTTPException(status_code=502, detail=f"Unexpected Hyper3D status response: {status_resp}")
-
-    job_statuses = {j.get("uuid"): j.get("status") for j in jobs}
-    all_done = all(s in ("Done", "Failed") for s in job_statuses.values())
-    any_failed = any(s == "Failed" for s in job_statuses.values())
-
-    now = datetime.utcnow().isoformat()
-
-    if all_done:
-        if any_failed:
-            status = "failed"
-            model_url = None
-        else:
-            download_resp = hyper3d_download_results(hyper_task_uuid)
-            items = download_resp.get("list", [])
-            chosen = None
-            for item in items:
-                name = item.get("name", "")
-                if name.lower().endswith(".glb"):
-                    chosen = item
-                    break
-            if chosen is None and items:
-                chosen = items[0]
-            model_url = chosen.get("url") if chosen else None
-            status = "done"
-
-        cur.execute(
-            """
-            UPDATE hyper3d_buddies
-            SET status = ?, model_url = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, model_url, now, buddy_id),
-        )
-        conn.commit()
-
-    else:
-        status = "running"
-        cur.execute(
-            """
-            UPDATE hyper3d_buddies
-            SET status = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, now, buddy_id),
-        )
-        conn.commit()
-
-    conn.close()
-    return Hyper3DStatusResponse(buddy_id=buddy_id, status=status, model_url=model_url)
-
-
-if __name__ == "__main__":
-    # Allow running directly or via `python -m vp_brain.mcp.selection_server`
-    import sys
-    import pathlib
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded audio: {e}")
+
+    # ----------------------------
+    # 2. STT: Speech -> Text
+    # ----------------------------
     try:
-        import uvicorn  # type: ignore
-    except Exception as exc:
-        raise SystemExit(
-            "Uvicorn is required to run the server. Install with 'pip install uvicorn'"
-        ) from exc
+        with tmp_path.open("rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model=STT_MODEL,
+                file=audio_file,
+                language="en",
+            )
+        user_text = (transcription.text or "").strip()
+    except Exception as e:
+        # Clean up tmp file even on failure
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"STT failed: {e}")
 
-    # Ensure project root is on sys.path when running directly
-    project_root = pathlib.Path(__file__).resolve().parents[2]
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+    # Clean temp file after successful STT
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    uvicorn.run(
-        "vp_brain.mcp.selection_server:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
-    )
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Empty transcription from audio")
+
+    # ----------------------------
+    # 3. Chat: generate Buddy reply
+    # ----------------------------
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": BUDDY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.8,
+        )
+        reply_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Chat completion failed: {e}")
+
+    if not reply_text:
+        raise HTTPException(status_code=500, detail="Empty reply from chat model")
+
+    # ----------------------------
+    # 4. TTS: reply_text -> mp3
+    # ----------------------------
+    audio_id = f"{uuid4().hex}.mp3"
+    audio_path = STATIC_DIR / audio_id
+
+    try:
+        # Stream TTS directly to file for lower memory usage
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL,
+            voice="alloy",  # other voices available: "verse", "nova", etc.
+            input=reply_text,
+        ) as response:
+            response.stream_to_file(audio_path)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+
+    # ----------------------------
+    # 5. Response to Unity
+    # ----------------------------
+    # Unity can hit: http://127.0.0.1:8000/static/audio/<audio_id>
+    audio_url = f"/static/audio/{audio_id}"
+
+    return {
+        "success": True,
+        "provider": "openai",
+        "transcript": user_text,
+        "reply_text": reply_text,
+        "audio_url": audio_url,
+    }
+
+
+# ============================================================
+#  (OPTIONAL) TEXT-ONLY CHAT ENDPOINT
+#  Useful if you want non-voice messages from Unity later.
+# ============================================================
+
+@app.post("/chat")
+async def chat(message: str):
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": BUDDY_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            temperature=0.8,
+        )
+        reply_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Chat failed: {e}")
+
+    return {
+        "success": True,
+        "reply_text": reply_text,
+    }
