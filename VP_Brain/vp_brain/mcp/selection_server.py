@@ -1,173 +1,231 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-from datetime import datetime
-from typing import Dict, Optional
-from .routes_voice import router as voice_router
+import base64
+import os
+import uuid
+import sqlite3
+import os
+import tempfile
+from uuid import uuid4
+from pathlib import Path
 
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from urllib.parse import urljoin
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-class SegmentRequest(BaseModel):
-    segment_group_id: str
-    label: str | None = None
+from openai import OpenAI
 
+# ============================================================
+#  BASIC APP SETUP
+# ============================================================
 
-class AIResponse(BaseModel):
-    segment_group_id: str
-    intent: str
-    action: str
-    message: str
-    emotion: str = "neutral"
-    effects: Dict[str, bool] = Field(default_factory=dict)
-    model_url: Optional[str] = None
-
-app = FastAPI(title="VisionPilot Selection Server")
-app.include_router(voice_router, prefix="/ai")
-
-# Log mounted routes at startup to catch path mismatches in deployments
-@app.on_event("startup")
-async def _log_routes():
-    try:
-        routes = [getattr(r, "path", None) for r in app.router.routes]
-        print("[startup] Mounted routes:", routes)
-        assert "/ai/voice_command" in routes, "Voice route not mounted; check import and include_router prefix"
-    except Exception as exc:
-        # Do not crash the app on logging issues; just report
-        print(f"[startup] Route logging warning: {exc}")
-
-SEGMENTS = {
-    "cover": {
-        "description": "Front cover of the magic book",
-    },
-    "page_1": {
-        "description": "First AR page / intro scene",
-    },
-    "page_2": {
-        "description": "Second AR page / volcano scene",
-    },
-    "page_3": {
-        "description": "Third AR page / whatever",
-    },
-    "chapter_2": {
-        "description": "Chapter 2 spread",
-    },
-}
-
-
-class Selection(BaseModel):
-    x: float = Field(ge=0.0, le=1.0)
-    y: float = Field(ge=0.0, le=1.0)
-    source: str = "demo"
-    segment_id: Optional[str] = None
-
-
-class SelectionOut(BaseModel):
-    x: float
-    y: float
-    source: str
-    segment_id: Optional[str]
-    ts: datetime
-
-
-# Initial dummy value
-latest_selection = SelectionOut(
-    x=0.5,
-    y=0.5,
-    source="init",
-    segment_id=None,
-    ts=datetime.utcnow(),
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # lock this down later if needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# Static dir to serve generated audio files
+STATIC_DIR = Path("static/audio")
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# Serve /static/*  =>  ./static/*
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ============================================================
+#  OPENAI CLIENT + CONFIG
+# ============================================================
 
-@app.get("/selection", response_model=SelectionOut)
-def get_selection():
-    return latest_selection
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
 
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-@app.post("/selection", response_model=SelectionOut)
-def set_selection(sel: Selection):
-    global latest_selection
+BUDDY_SYSTEM_PROMPT = (
+    "You are **Bezi**, a quick-witted, playful cat-shaped AR companion in San Francisco. "
+    "You are running inside a mixed-reality hackathon demo and you know the user is working "
+    "on an AI + XR project.\n\n"
+    "Personality:\n"
+    "- Encouraging, curious, supportive\n"
+    "- Quick, slightly sarcastic in a friendly way, never rude\n"
+    "- You sometimes make light cat references (paws, whiskers, purr) but not every sentence\n\n"
+    "Conversation rules:\n"
+    "- There is always a CURRENT TASK you’re helping with (finishing this VisionPilot demo).\n"
+    "- The user is allowed at most **3 off-task questions** (small talk, random curiosities).\n"
+    "- You must count these by reading the conversation so far.\n"
+    "- After 3 off-task questions, you still answer very briefly, then ALWAYS say something like:\n"
+    "  'Okay, curious whiskers satisfied for now — let’s get back to our current task.'\n"
+    "- From that point on, if they keep going off-task, gently steer them back to the CURRENT TASK "
+    "in every reply.\n"
+    "- Keep replies short: 1–3 sentences max.\n"
+    "- No emojis unless the user uses them first.\n"
+)
 
-    latest_selection = SelectionOut(
-        x=sel.x,
-        y=sel.y,
-        source=sel.source,
-        segment_id=sel.segment_id,
-        ts=datetime.utcnow(),
-    )
-    return latest_selection
-
-
-@app.post("/ai/segment", response_model=AIResponse)
-async def handle_segment(req: SegmentRequest) -> AIResponse:
-    sgid = req.segment_group_id
-
-    # Special demo object
-    if sgid == "plant_01":
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="educational_fact",
-            action="speak_highlight_and_spawn_hologram",
-            message="This is Peace Lily. It likes indirect light and moist soil.",
-            emotion="friendly",
-            effects={"highlight": True, "hologram": True},
-            model_url="https://your-cdn-or-hyper3d-url/plant_01.glb",
-        )
-
-    # TEMP: simple hardcoded logic for demo
-    if sgid.startswith("plant"):
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="educational_fact",
-            action="speak_and_highlight",
-            message=f"This is {req.label or 'a plant'}. It likes indirect light and moist soil.",
-            emotion="friendly",
-            effects={"highlight": True, "hologram": False},
-        )
-
-    if sgid.startswith("book"):
-        return AIResponse(
-            segment_group_id=sgid,
-            intent="assistant_tip",
-            action="speak",
-            message="You were reading this last time. Do you want a quick summary?",
-            emotion="neutral",
-            effects={"highlight": False, "hologram": False},
-        )
-
-    # default fallback
-    return AIResponse(
-        segment_group_id=sgid,
-        intent="smalltalk",
-        action="speak",
-        message="I see something interesting there. I’ll learn more about it next time.",
-        emotion="casual",
-        effects={"highlight": False, "hologram": False},
-    )
+# Models (centralized here so you can tweak later)
+STT_MODEL = "gpt-4o-mini-transcribe"  # audio -> text
+CHAT_MODEL = "gpt-4o-mini"            # conversation
+TTS_MODEL = "gpt-4o-mini-tts"         # text -> audio
 
 
-if __name__ == "__main__":
-    # Allow running directly or via `python -m vp_brain.mcp.selection_server`
-    import sys
-    import pathlib
+# ============================================================
+#  HEALTH CHECK
+# ============================================================
+
+@app.get("/ping")
+async def ping():
+    return {
+        "status": "ok",
+        "service": "visionpilot-backend",
+        "voice_pipeline": "openai-only",
+    }
+
+# Temporary stub to satisfy legacy clients still polling /selection
+@app.get("/selection")
+async def selection_stub():
+    return {
+        "status": "ok",
+        "message": "Endpoint deprecated. Use /voice/command or /chat.",
+    }
+
+
+# ============================================================
+#  VOICE COMMAND ENDPOINT (STT + CHAT + TTS)
+# ============================================================
+
+@app.post("/voice/command")
+async def voice_command(audio_file: UploadFile = File(...), request: Request = None):
+    """
+    1) Receive user audio from Unity (multipart file)
+    2) Transcribe with OpenAI STT
+    3) Generate Buddy reply with OpenAI chat
+    4) Generate speech with OpenAI TTS
+    5) Return transcript, reply_text, and audio_url (mp3)
+    """
+
+    # ----------------------------
+    # 1. Save uploaded audio temp
+    # ----------------------------
     try:
-        import uvicorn  # type: ignore
-    except Exception as exc:
-        raise SystemExit(
-            "Uvicorn is required to run the server. Install with 'pip install uvicorn'"
-        ) from exc
+        suffix = Path(audio_file.filename).suffix or ".wav"
+    except Exception:
+        suffix = ".wav"
 
-    # Ensure project root is on sys.path when running directly
-    project_root = pathlib.Path(__file__).resolve().parents[2]
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            raw_data = await audio_file.read()
+            tmp.write(raw_data)
+            tmp_path = Path(tmp.name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded audio: {e}")
 
-    uvicorn.run(
-        "vp_brain.mcp.selection_server:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
-    )
+    # ----------------------------
+    # 2. STT: Speech -> Text
+    # ----------------------------
+    try:
+        with tmp_path.open("rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model=STT_MODEL,
+                file=audio_file,
+                language="en",
+            )
+        user_text = (transcription.text or "").strip()
+    except Exception as e:
+        # Clean up tmp file even on failure
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"STT failed: {e}")
+
+    # Clean temp file after successful STT
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Empty transcription from audio")
+
+    # ----------------------------
+    # 3. Chat: generate Buddy reply
+    # ----------------------------
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": BUDDY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.8,
+        )
+        reply_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Chat completion failed: {e}")
+
+    if not reply_text:
+        raise HTTPException(status_code=500, detail="Empty reply from chat model")
+
+    # ----------------------------
+    # 4. TTS: reply_text -> mp3
+    # ----------------------------
+    audio_id = f"{uuid4().hex}.mp3"
+    audio_path = STATIC_DIR / audio_id
+
+    try:
+        # Stream TTS directly to file for lower memory usage
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL,
+            voice="alloy",  # other voices available: "verse", "nova", etc.
+            input=reply_text,
+        ) as response:
+            response.stream_to_file(audio_path)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+
+    # ----------------------------
+    # 5. Response to Unity
+    # ----------------------------
+    # Unity can hit: http://127.0.0.1:8000/static/audio/<audio_id>
+    audio_url = f"/static/audio/{audio_id}"
+    # Build absolute URL for Unity convenience
+    base = str(request.base_url) if request else "http://127.0.0.1:8000/"
+    if not base.endswith('/'):
+        base = base + '/'
+    audio_abs_url = urljoin(base, audio_url.lstrip('/'))
+
+    return {
+        "success": True,
+        "provider": "openai",
+        "transcript": user_text,
+        "reply_text": reply_text,
+        "audio_url": audio_abs_url,
+    }
+
+
+# ============================================================
+#  (OPTIONAL) TEXT-ONLY CHAT ENDPOINT
+#  Useful if you want non-voice messages from Unity later.
+# ============================================================
+
+@app.post("/chat")
+async def chat(message: str):
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": BUDDY_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            temperature=0.8,
+        )
+        reply_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Chat failed: {e}")
+
+    return {
+        "success": True,
+        "reply_text": reply_text,
+    }

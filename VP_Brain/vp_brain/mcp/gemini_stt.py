@@ -4,13 +4,16 @@ from typing import Optional
 
 import google.generativeai as genai
 
-load_dotenv()  # loads variables from .env if present
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Load variables from .env if present
+load_dotenv()
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set in environment")
+# Support either env var name
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
+if not API_KEY:
+    raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY not set in environment")
+
+genai.configure(api_key=API_KEY)
 
 
 def transcribe_audio_gemini_wav(audio_bytes: bytes) -> Optional[str]:
