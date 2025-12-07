@@ -7,7 +7,8 @@ import tempfile
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from urllib.parse import urljoin
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -44,14 +45,24 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-BUDDY_SYSTEM_PROMPT = os.getenv(
-    "BUDDY_SYSTEM_PROMPT",
-    (
-        "You are Buddy, a supportive, slightly witty AR/VR companion. "
-        "Speak in short, natural sentences. Respond like you are inside "
-        "a mixed-reality world helping the user explore and play. "
-        "Avoid long monologues; keep it tight and helpful."
-    ),
+BUDDY_SYSTEM_PROMPT = (
+    "You are **Bezi**, a quick-witted, playful cat-shaped AR companion in San Francisco. "
+    "You are running inside a mixed-reality hackathon demo and you know the user is working "
+    "on an AI + XR project.\n\n"
+    "Personality:\n"
+    "- Encouraging, curious, supportive\n"
+    "- Quick, slightly sarcastic in a friendly way, never rude\n"
+    "- You sometimes make light cat references (paws, whiskers, purr) but not every sentence\n\n"
+    "Conversation rules:\n"
+    "- There is always a CURRENT TASK you’re helping with (finishing this VisionPilot demo).\n"
+    "- The user is allowed at most **3 off-task questions** (small talk, random curiosities).\n"
+    "- You must count these by reading the conversation so far.\n"
+    "- After 3 off-task questions, you still answer very briefly, then ALWAYS say something like:\n"
+    "  'Okay, curious whiskers satisfied for now — let’s get back to our current task.'\n"
+    "- From that point on, if they keep going off-task, gently steer them back to the CURRENT TASK "
+    "in every reply.\n"
+    "- Keep replies short: 1–3 sentences max.\n"
+    "- No emojis unless the user uses them first.\n"
 )
 
 # Models (centralized here so you can tweak later)
@@ -72,13 +83,21 @@ async def ping():
         "voice_pipeline": "openai-only",
     }
 
+# Temporary stub to satisfy legacy clients still polling /selection
+@app.get("/selection")
+async def selection_stub():
+    return {
+        "status": "ok",
+        "message": "Endpoint deprecated. Use /voice/command or /chat.",
+    }
+
 
 # ============================================================
 #  VOICE COMMAND ENDPOINT (STT + CHAT + TTS)
 # ============================================================
 
 @app.post("/voice/command")
-async def voice_command(file: UploadFile = File(...)):
+async def voice_command(audio_file: UploadFile = File(...), request: Request = None):
     """
     1) Receive user audio from Unity (multipart file)
     2) Transcribe with OpenAI STT
@@ -91,13 +110,13 @@ async def voice_command(file: UploadFile = File(...)):
     # 1. Save uploaded audio temp
     # ----------------------------
     try:
-        suffix = Path(file.filename).suffix or ".wav"
+        suffix = Path(audio_file.filename).suffix or ".wav"
     except Exception:
         suffix = ".wav"
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            raw_data = await file.read()
+            raw_data = await audio_file.read()
             tmp.write(raw_data)
             tmp_path = Path(tmp.name)
     except Exception as e:
@@ -172,13 +191,18 @@ async def voice_command(file: UploadFile = File(...)):
     # ----------------------------
     # Unity can hit: http://127.0.0.1:8000/static/audio/<audio_id>
     audio_url = f"/static/audio/{audio_id}"
+    # Build absolute URL for Unity convenience
+    base = str(request.base_url) if request else "http://127.0.0.1:8000/"
+    if not base.endswith('/'):
+        base = base + '/'
+    audio_abs_url = urljoin(base, audio_url.lstrip('/'))
 
     return {
         "success": True,
         "provider": "openai",
         "transcript": user_text,
         "reply_text": reply_text,
-        "audio_url": audio_url,
+        "audio_url": audio_abs_url,
     }
 
 
