@@ -23,6 +23,6 @@ $env:PYTHONPATH = $PSScriptRoot
 $reloadArg = $null
 if (-not $NoReload.IsPresent) { $reloadArg = "--reload" }
 
-uvicorn "vp_brain.mcp.selection_server:app" --host $Host --port $Port $reloadArg
+uvicorn "vp_brain.mcp.selection_server:app" --app-dir $PSScriptRoot --host $Host --port $Port $reloadArg
 
 Pop-Location
