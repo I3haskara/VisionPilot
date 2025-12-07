@@ -9,23 +9,49 @@ from typing import Dict, Optional
 import httpx
 import requests
 from dotenv import load_dotenv
+from openai import OpenAI
 from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .routes_voice import router as voice_router
-from vp_brain.stt_gemini import transcribe_audio_wav
 
-# Load .env and log a brief sanity check (without secrets)
-load_dotenv()
-print("[env] Loaded .env; keys present ->",
-    "HYPER3D_API_KEY=", bool(os.getenv("HYPER3D_API_KEY")),
+# -------------------------------------------------------------------
+# Load .env explicitly from VP_Brain root (one level above vp_brain/)
+# -------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # F:\SenseAIProject\VisionPilot\VP_Brain
+ENV_PATH = PROJECT_ROOT / ".env"
+
+load_dotenv(dotenv_path=ENV_PATH)
+
+print(
+    "[env] Loaded .env from", ENV_PATH,
+    "-> HYPER3D_API_KEY=", bool(os.getenv("HYPER3D_API_KEY")),
     "GOOGLE_API_KEY=", bool(os.getenv("GOOGLE_API_KEY")),
     "GEMINI_API_KEY=", bool(os.getenv("GEMINI_API_KEY")),
-    "ELEVENLABS_API_KEY=", bool(os.getenv("ELEVENLABS_API_KEY")))
+    "ELEVENLABS_API_KEY=", bool(os.getenv("ELEVENLABS_API_KEY")),
+)
+
+# Extra visibility: log the configured ElevenLabs voice ID (if present)
+if os.getenv("ELEVENLABS_VOICE_ID"):
+    print("[env] ELEVENLABS_VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID"))
+
+# Also log OpenAI credentials presence (not values) for STT
+print(
+    "[env] OPENAI_API_KEY=", bool(os.getenv("OPENAI_API_KEY")),
+    "OPENAI_ORG_ID=", bool(os.getenv("OPENAI_ORG_ID")),
+)
 
 app = FastAPI(title="VisionPilot Selection Server")
 app.include_router(voice_router, prefix="/ai")
+
+# Initialize OpenAI client using env var
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID")
+if OPENAI_API_KEY or OPENAI_ORG_ID:
+    client = OpenAI(api_key=OPENAI_API_KEY, organization=OPENAI_ORG_ID)
+else:
+    client = OpenAI()
 
 # --- TTS (ElevenLabs) ---
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -49,6 +75,10 @@ async def tts_generate(req: TTSRequest):
     # Fallback to env voice id if not provided
     env_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
     voice_id = req.voice_id or env_voice_id
+    # Debug which voice ID is used and source
+    print(
+        f"[TTS] using voice_id='{voice_id}' (req.voice_id={req.voice_id!r}, env={env_voice_id!r})"
+    )
     if not voice_id:
         raise HTTPException(status_code=400, detail="voice_id missing and ELEVENLABS_VOICE_ID not set")
 
@@ -108,6 +138,9 @@ async def tts_test():
         "model_id": "eleven_turbo_v2",
     }
 
+    # Debug: show which voice ID is being used from env
+    print(f"[TTS TEST] ELEVENLABS_VOICE_ID from env: {env_voice_id}")
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(tts_url, headers=headers, json=payload)
         if resp.status_code != 200:
@@ -128,36 +161,73 @@ async def tts_test():
 app.include_router(tts_router)
 app.mount("/static_tts", StaticFiles(directory=TTS_OUTPUT_DIR), name="static_tts")
 
+DEBUG_DIR = Path("debug_audio")
+DEBUG_DIR.mkdir(exist_ok=True)
 
-# --- Voice command STT endpoint (hard override; no more stub) ---
 @app.post("/voice/command")
 async def voice_command(audio: UploadFile = File(...)):
     """
-    Accepts a WAV file from Unity and returns:
-      - user_text: transcription (Gemini STT)
-      - ai_text: echo reply we can show in UI
+    Main mic → STT → AI → TTS endpoint used by Unity (MicCommandController).
+    Unity sends one form field named 'audio' with a WAV file.
     """
-    data = await audio.read()
-
     try:
-        text = transcribe_audio_wav(data) or ""
+        # 0) Basic validation and logging
+        print(f"[voice_command] filename={audio.filename!r} content_type={audio.content_type!r}")
+        if not audio.filename:
+            raise HTTPException(status_code=400, detail="No audio file uploaded")
+
+        # 1) Read bytes and save debug WAV
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded audio is empty")
+
+        debug_path = DEBUG_DIR / "debug_voice.wav"
+        with open(debug_path, "wb") as f:
+            f.write(audio_bytes)
+
+        # 2) Transcribe using Whisper (requires OPENAI_API_KEY; expects WAV/MP3)
+        try:
+            with open(debug_path, "rb") as f:
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                )
+            user_text = (transcription.text or "").strip()
+        except Exception as e:
+            print(f"[voice_command] Transcription error: {e}")
+            raise HTTPException(status_code=502, detail=f"Transcription failed: {e}")
+
+        # 3) Chat completion for AI reply
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful AR desk buddy assistant."},
+                    {"role": "user", "content": user_text or ""},
+                ],
+                temperature=0.7,
+            )
+            ai_text = (completion.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[voice_command] Chat completion error: {e}")
+            raise HTTPException(status_code=502, detail=f"AI reply failed: {e}")
+
+        # 4) Return response (no TTS b64 here; hook into your TTS helper if needed)
+        return {
+            "user_text": user_text,
+            "ai_text": ai_text,
+            "action": "spawn",
+            "effects": {"highlight": True, "hologram": True},
+            "model_url": None,
+            "voice_b64": None,
+        }
+    except HTTPException:
+        # Re-raise HTTPExceptions untouched
+        raise
     except Exception as e:
-        print("Gemini STT error:", e)
-        text = "(STT error or empty audio)"
-
-    ai_text = f"I heard: {text}"
-
-    return {
-        "user_text": text,
-        "ai_text": ai_text,
-        "action": "spawn",
-        "effects": {
-            "highlight": True,
-            "hologram": True,
-        },
-        "model_url": None,
-        "voice_b64": None,
-    }
+        # Catch-all to avoid 500 without context
+        print(f"[voice_command] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
 
 class SegmentRequest(BaseModel):
